@@ -1,20 +1,61 @@
 package codecrafters.modelo;
 
+
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 
+import jakarta.persistence.CascadeType;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.Table;
+    
+@Entity
+@Table(name = "reserva")
 public class Reserva {
-    private int idReserva;
-    private LocalDate fechaEntrada;
-    private LocalDate fechaSalida;
-    private int numeroPersonas;
-    private String estado;
-    private double importe;
-    private Cliente cliente;
-    private List<LineaReserva> lineasReserva;
 
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "id_reserva")
+    private int idReserva;
+
+    @Column(name = "fecha_entrada", nullable = false)
+    private LocalDate fechaEntrada;
+
+    @Column(name = "fecha_salida", nullable = false)
+    private LocalDate fechaSalida;
+
+    @Column(name = "numero_personas", nullable = false)
+    private int numeroPersonas;
+
+    @Column(name = "estado", nullable = false)
+    private String estado;
+
+    @Column(name = "importe", nullable = false)
+    private double importe;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "id_cliente", nullable = false)
+    private Cliente cliente;
+
+    @OneToMany(
+        mappedBy = "reserva",
+        cascade = CascadeType.ALL,
+        orphanRemoval = true
+    )
+
+    private List<LineaReserva> lineasReserva = new ArrayList<>();
+
+    protected Reserva() {
+}
     // Constructor 
     public Reserva(int idReserva, LocalDate fechaEntrada, LocalDate fechaSalida, int numeroPersonas, String estado) {
         this.idReserva = idReserva;

@@ -1,22 +1,21 @@
+
 package codecrafters.dao;
 
-import codecrafters.config.ConexionBD;
+import java.time.LocalDate;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeSet;
+
+import codecrafters.config.JPAUtil;
 import codecrafters.modelo.Cliente;
 import codecrafters.modelo.Habitacion;
 import codecrafters.modelo.Hotel;
 import codecrafters.modelo.LineaReserva;
 import codecrafters.modelo.Reserva;
-import java.sql.CallableStatement;
-import java.sql.Connection;
-import java.sql.Date;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.time.LocalDate;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.TreeSet;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityTransaction;
+import jakarta.persistence.LockModeType;
 
 public class ReservaDAOImpl implements ReservaDAO {
 
@@ -24,382 +23,351 @@ public class ReservaDAOImpl implements ReservaDAO {
     // GUARDAR UNA RESERVA
     // --------------------------------------------------
 
-    @Override
-    public void guardar(Reserva reserva) {
+   
+@Override
+public void guardar(Reserva reserva) {
 
-        if (reserva == null) {
-            throw new IllegalArgumentException("La reserva no puede ser nula.");
-        }
+    if (reserva == null) {
+        throw new IllegalArgumentException(
+            "La reserva no puede ser nula."
+        );
+    }
 
-        if (reserva.getFechaEntrada() == null
-                || reserva.getFechaSalida() == null
-                || !reserva.getFechaSalida().isAfter(reserva.getFechaEntrada())) {
+    if (reserva.getFechaEntrada() == null
+            || reserva.getFechaSalida() == null
+            || !reserva.getFechaSalida().isAfter(
+                reserva.getFechaEntrada())) {
+        throw new IllegalArgumentException(
+            "La fecha de salida debe ser posterior a la entrada."
+        );
+    }
+
+    if (reserva.getNumeroPersonas() <= 0) {
+        throw new IllegalArgumentException(
+            "El número de personas debe ser mayor que cero."
+        );
+    }
+
+    if (reserva.getCliente() == null
+            || reserva.getCliente().getIdPersona() <= 0) {
+        throw new IllegalArgumentException(
+            "Debes seleccionar un cliente válido."
+        );
+    }
+
+    if (reserva.getLineasReserva() == null
+            || reserva.getLineasReserva().isEmpty()) {
+        throw new IllegalArgumentException(
+            "La reserva debe contener al menos una habitación."
+        );
+    }
+
+    // Ordenar las habitaciones y evitar duplicados.
+    TreeSet<Integer> idsHabitaciones = new TreeSet<>();
+
+    for (LineaReserva linea : reserva.getLineasReserva()) {
+
+        if (linea == null || linea.getHabitacion() == null
+                || linea.getHabitacion().getIdHabitacion() <= 0) {
             throw new IllegalArgumentException(
-                "La fecha de salida debe ser posterior a la fecha de entrada."
+                "La reserva contiene una habitación no válida."
             );
         }
 
-        if (reserva.getNumeroPersonas() <= 0) {
+        int id = linea.getHabitacion().getIdHabitacion();
+
+        if (!idsHabitaciones.add(id)) {
             throw new IllegalArgumentException(
-                "El número de personas debe ser mayor que cero."
+                "La habitación " + id + " está duplicada."
             );
         }
+    }
 
-        if (reserva.getCliente() == null
-                || reserva.getCliente().getIdPersona() <= 0) {
-            throw new IllegalArgumentException(
-                "Debes seleccionar un cliente válido."
+    EntityManager em = JPAUtil.getEntityManagerFactory()
+            .createEntityManager();
+
+    EntityTransaction transaccion = em.getTransaction();
+
+    try {
+        transaccion.begin();
+
+        // Bloquear las habitaciones en orden.
+        Map<Integer, Habitacion> habitaciones =
+                new HashMap<>();
+
+        for (int id : idsHabitaciones) {
+
+            Habitacion habitacion = em.find(
+                Habitacion.class,
+                id,
+                LockModeType.PESSIMISTIC_WRITE
             );
-        }
 
-        if (reserva.getLineasReserva() == null
-                || reserva.getLineasReserva().isEmpty()) {
-            throw new IllegalArgumentException(
-                "La reserva debe contener al menos una habitación."
-            );
-        }
-
-        String sqlBloquearHabitacion = """
-            SELECT capacidad, precio_noche
-            FROM habitacion
-            WHERE id_habitacion = ?
-            FOR UPDATE
-            """;
-
-        String sqlDisponibilidad = """
-            SELECT COUNT(*)
-            FROM linea_reserva lr
-            INNER JOIN reserva r
-                ON lr.id_reserva = r.id_reserva
-            WHERE lr.id_habitacion = ?
-              AND r.estado <> 'Cancelada'
-              AND r.fecha_entrada < ?
-              AND r.fecha_salida > ?
-            """;
-
-        String sqlInsertarReserva = """
-            INSERT INTO reserva
-                (fecha_entrada, fecha_salida, numero_personas,
-                 estado, importe, id_cliente)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """;
-
-        String sqlInsertarLinea = """
-            INSERT INTO linea_reserva
-                (id_reserva, id_habitacion, precio_noche)
-            VALUES (?, ?, ?)
-            """;
-
-       try (Connection conexion = ConexionBD.obtenerConexion()) {
-        conexion.setTransactionIsolation(
-        Connection.TRANSACTION_READ_COMMITTED
-    );
-
-    conexion.setAutoCommit(false);
-
-            try {
-                // Comprobar que el cliente existe.
-                comprobarCliente(conexion, reserva.getCliente().getIdPersona());
-
-                // Ordenar los IDs para reducir el riesgo de bloqueos cruzados.
-                TreeSet<Integer> idsHabitaciones = new TreeSet<>();
-
-                for (LineaReserva linea : reserva.getLineasReserva()) {
-                    if (linea == null || linea.getHabitacion() == null
-                            || linea.getHabitacion().getIdHabitacion() <= 0) {
-                        throw new IllegalArgumentException(
-                            "La reserva contiene una habitación no válida."
-                        );
-                    }
-
-                    idsHabitaciones.add(
-                        linea.getHabitacion().getIdHabitacion()
-                    );
-                }
-
-                // Bloquear las habitaciones y comprobar su disponibilidad.
-                try (PreparedStatement bloquear =
-                        conexion.prepareStatement(sqlBloquearHabitacion);
-                     PreparedStatement disponibilidad =
-                        conexion.prepareStatement(sqlDisponibilidad)) {
-
-                    for (int idHabitacion : idsHabitaciones) {
-
-                        bloquear.setInt(1, idHabitacion);
-
-                        int capacidad;
-                        double precioNoche;
-
-                        try (ResultSet resultado = bloquear.executeQuery()) {
-
-                            if (!resultado.next()) {
-                                throw new IllegalArgumentException(
-                                    "No existe la habitación con ID "
-                                    + idHabitacion
-                                );
-                            }
-
-                            capacidad = resultado.getInt("capacidad");
-                            precioNoche = resultado.getDouble("precio_noche");
-                        }
-
-                        if (capacidad < reserva.getNumeroPersonas()) {
-                            throw new IllegalArgumentException(
-                                "La habitación " + idHabitacion
-                                + " no tiene capacidad suficiente."
-                            );
-                        }
-
-                        disponibilidad.setInt(1, idHabitacion);
-                        disponibilidad.setDate(
-                            2, Date.valueOf(reserva.getFechaSalida())
-                        );
-                        disponibilidad.setDate(
-                            3, Date.valueOf(reserva.getFechaEntrada())
-                        );
-
-                        try (ResultSet resultado =
-                                disponibilidad.executeQuery()) {
-
-                            resultado.next();
-
-                            if (resultado.getInt(1) > 0) {
-                                throw new IllegalStateException(
-                                    "La habitación " + idHabitacion
-                                    + " ya está reservada para esas fechas."
-                                );
-                            }
-                        }
-
-                        // Utilizar el precio actual de la base de datos.
-                        for (LineaReserva linea : reserva.getLineasReserva()) {
-                            if (linea.getHabitacion().getIdHabitacion()
-                                    == idHabitacion) {
-                                linea.setPrecioNoche(precioNoche);
-                            }
-                        }
-                    }
-                }
-
-                // Calcular el importe con los precios recuperados de MySQL.
-                reserva.calcularImporte();
-
-                // Insertar la reserva y recuperar su ID autogenerado.
-                try (PreparedStatement insertar =
-                        conexion.prepareStatement(
-                            sqlInsertarReserva,
-                            Statement.RETURN_GENERATED_KEYS
-                        )) {
-
-                    insertar.setDate(
-                        1, Date.valueOf(reserva.getFechaEntrada())
-                    );
-                    insertar.setDate(
-                        2, Date.valueOf(reserva.getFechaSalida())
-                    );
-                    insertar.setInt(3, reserva.getNumeroPersonas());
-
-                    String estado = reserva.getEstado();
-                    insertar.setString(
-                        4, estado == null ? "Confirmada" : estado
-                    );
-
-                    insertar.setDouble(5, reserva.getImporte());
-                    insertar.setInt(
-                        6, reserva.getCliente().getIdPersona()
-                    );
-
-                    insertar.executeUpdate();
-
-                    try (ResultSet claves = insertar.getGeneratedKeys()) {
-
-                        if (!claves.next()) {
-                            throw new SQLException(
-                                "No se pudo obtener el ID de la reserva."
-                            );
-                        }
-
-                        reserva.setIdReserva(claves.getInt(1));
-                    }
-                }
-
-                // Insertar las habitaciones de la reserva.
-                try (PreparedStatement insertarLinea =
-                        conexion.prepareStatement(sqlInsertarLinea)) {
-
-                    for (LineaReserva linea : reserva.getLineasReserva()) {
-
-                        insertarLinea.setInt(1, reserva.getIdReserva());
-                        insertarLinea.setInt(
-                            2, linea.getHabitacion().getIdHabitacion()
-                        );
-                        insertarLinea.setDouble(
-                            3, linea.getPrecioNoche()
-                        );
-
-                        insertarLinea.executeUpdate();
-                    }
-                }
-
-                conexion.commit();
-
-            } catch (Exception e) {
-
-                conexion.rollback();
-
-                if (e instanceof RuntimeException) {
-                    throw (RuntimeException) e;
-                }
-
-                throw new IllegalStateException(
-                    "Error al guardar la reserva.", e
+            if (habitacion == null) {
+                throw new IllegalArgumentException(
+                    "No existe la habitación con ID " + id
                 );
-
-            } finally {
-                conexion.setAutoCommit(true);
             }
 
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                "Error de conexión al guardar la reserva.", e
+            if (habitacion.getCapacidad()
+                    < reserva.getNumeroPersonas()) {
+                throw new IllegalArgumentException(
+                    "La habitación " + id +
+                    " no tiene capacidad suficiente."
+                );
+            }
+
+            habitaciones.put(id, habitacion);
+        }
+
+        // Comprobar que el cliente existe.
+        Cliente cliente = em.find(
+            Cliente.class,
+            reserva.getCliente().getIdPersona()
+        );
+
+        if (cliente == null) {
+            throw new IllegalArgumentException(
+                "El cliente seleccionado no existe."
             );
         }
-    }
 
-    // --------------------------------------------------
-    // COMPROBAR QUE EXISTE EL CLIENTE
-    // --------------------------------------------------
+        reserva.setCliente(cliente);
 
-    private void comprobarCliente(Connection conexion, int idCliente)
-            throws SQLException {
-
-        String sql = """
-            SELECT COUNT(*)
-            FROM cliente
-            WHERE id_persona = ?
+        // Comprobar que no existan reservas solapadas.
+        String jpql = """
+            SELECT COUNT(lr)
+            FROM LineaReserva lr
+            WHERE lr.habitacion.idHabitacion = :idHabitacion
+              AND lr.reserva.estado <> :cancelada
+              AND lr.reserva.fechaEntrada < :fechaSalida
+              AND lr.reserva.fechaSalida > :fechaEntrada
             """;
 
-        try (PreparedStatement sentencia =
-                conexion.prepareStatement(sql)) {
+        for (LineaReserva linea : reserva.getLineasReserva()) {
 
-            sentencia.setInt(1, idCliente);
+            int id = linea.getHabitacion().getIdHabitacion();
 
-            try (ResultSet resultado = sentencia.executeQuery()) {
-                resultado.next();
+            Long ocupadas = em.createQuery(
+                jpql, Long.class
+            )
+            .setParameter("idHabitacion", id)
+            .setParameter("cancelada", "Cancelada")
+            .setParameter("fechaEntrada",
+                reserva.getFechaEntrada())
+            .setParameter("fechaSalida",
+                reserva.getFechaSalida())
+            .getSingleResult();
 
-                if (resultado.getInt(1) == 0) {
-                    throw new IllegalArgumentException(
-                        "El cliente seleccionado no existe."
-                    );
-                }
+            if (ocupadas > 0) {
+                throw new IllegalStateException(
+                    "La habitación " + id +
+                    " ya está reservada para esas fechas."
+                );
             }
+
+            // Utilizar la entidad y el precio de MySQL.
+            Habitacion habitacion = habitaciones.get(id);
+
+            linea.setHabitacion(habitacion);
+            linea.setPrecioNoche(
+                habitacion.getPrecioNoche()
+            );
+            linea.setReserva(reserva);
         }
+
+        if (reserva.getEstado() == null
+                || reserva.getEstado().isBlank()) {
+            reserva.setEstado("Confirmada");
+        }
+
+        // Calcular el importe total.
+        reserva.calcularImporte();
+
+        // Guardar reserva y líneas mediante JPA.
+        em.persist(reserva);
+        em.flush();
+
+        // Confirmar todos los cambios.
+        transaccion.commit();
+
+    } catch (RuntimeException e) {
+
+        if (transaccion.isActive()) {
+            transaccion.rollback();
+        }
+
+        throw e;
+
+    } finally {
+        em.close();
     }
+}
 
     // --------------------------------------------------
     // LISTAR TODAS LAS RESERVAS
     // --------------------------------------------------
 
-    @Override
-    public List<Reserva> listar() {
+    
+@Override
+public List<Reserva> listar() {
 
-        List<Integer> ids = new ArrayList<>();
+    EntityManager em = JPAUtil.getEntityManagerFactory()
+            .createEntityManager();
 
-        String sql = """
-            SELECT id_reserva
-            FROM reserva
-            ORDER BY id_reserva
-            """;
+    try {
+        List<Reserva> reservas = em.createQuery(
+            """
+            SELECT DISTINCT r
+            FROM Reserva r
+            JOIN FETCH r.cliente
+            LEFT JOIN FETCH r.lineasReserva
+            ORDER BY r.idReserva
+            """,
+            Reserva.class
+        ).getResultList();
 
-        try (Connection conexion = ConexionBD.obtenerConexion();
-             PreparedStatement sentencia = conexion.prepareStatement(sql);
-             ResultSet resultado = sentencia.executeQuery()) {
+        // Cargar las habitaciones antes de cerrar
+        // el EntityManager.
+        for (Reserva reserva : reservas) {
+            for (LineaReserva linea :
+                    reserva.getLineasReserva()) {
 
-            while (resultado.next()) {
-                ids.add(resultado.getInt("id_reserva"));
+                if (linea.getHabitacion() != null) {
+                    linea.getHabitacion().getNumero();
+                }
             }
-
-            List<Reserva> reservas = new ArrayList<>();
-
-            for (int id : ids) {
-                reservas.add(cargarReserva(conexion, id));
-            }
-
-            return reservas;
-
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                "Error al listar las reservas.", e
-            );
         }
+
+        return reservas;
+
+    } finally {
+        em.close();
     }
+}
+
 
     // --------------------------------------------------
     // BUSCAR RESERVAS POR CLIENTE
     // --------------------------------------------------
 
-    @Override
-    public List<Reserva> buscarPorCliente(Cliente cliente) {
+    
+@Override
+public List<Reserva> buscarPorCliente(Cliente cliente) {
 
-        if (cliente == null) {
-            throw new IllegalArgumentException("El cliente no puede ser nulo.");
-        }
-
-        return listarReservasPorCliente(cliente.getIdPersona());
-    }
-
-    @Override
-    public List<Reserva> listarReservasPorCliente(int idCliente) {
-
-        return buscarPorFiltro(
-            "SELECT id_reserva FROM reserva WHERE id_cliente = ? ORDER BY id_reserva",
-            idCliente
+    if (cliente == null || cliente.getIdPersona() <= 0) {
+        throw new IllegalArgumentException(
+            "El cliente no es válido."
         );
     }
+
+    return listarReservasPorCliente(cliente.getIdPersona());
+}
+
+
+    
+@Override
+public List<Reserva> listarReservasPorCliente(int idCliente) {
+
+    if (idCliente <= 0) {
+        throw new IllegalArgumentException(
+            "El ID del cliente no es válido."
+        );
+    }
+
+    EntityManager em = JPAUtil.getEntityManagerFactory()
+            .createEntityManager();
+
+    try {
+        List<Reserva> reservas = em.createQuery(
+            """
+            SELECT DISTINCT r
+            FROM Reserva r
+            JOIN FETCH r.cliente
+            LEFT JOIN FETCH r.lineasReserva
+            WHERE r.cliente.idPersona = :idCliente
+            ORDER BY r.idReserva
+            """,
+            Reserva.class
+        )
+        .setParameter("idCliente", idCliente)
+        .getResultList();
+
+        // Cargar las habitaciones antes de cerrar
+        // el EntityManager.
+        for (Reserva reserva : reservas) {
+            for (LineaReserva linea :
+                    reserva.getLineasReserva()) {
+
+                if (linea.getHabitacion() != null) {
+                    linea.getHabitacion().getNumero();
+                }
+            }
+        }
+
+        return reservas;
+
+    } finally {
+        em.close();
+    }
+}
 
     // --------------------------------------------------
     // BUSCAR RESERVAS POR HOTEL
     // --------------------------------------------------
 
-    @Override
-    public List<Reserva> buscarPorHotel(Hotel hotel) {
+@Override
+public List<Reserva> buscarPorHotel(Hotel hotel) {
 
-        if (hotel == null) {
-            throw new IllegalArgumentException("El hotel no puede ser nulo.");
-        }
+    if (hotel == null || hotel.getIdHotel() <= 0) {
+        throw new IllegalArgumentException(
+            "El hotel seleccionado no es válido."
+        );
+    }
 
-        List<Integer> ids = new ArrayList<>();
+    EntityManager em = JPAUtil.getEntityManagerFactory()
+            .createEntityManager();
 
-        String sql = """
-            SELECT DISTINCT r.id_reserva
-            FROM reserva r
-            INNER JOIN linea_reserva lr
-                ON r.id_reserva = lr.id_reserva
-            INNER JOIN habitacion h
-                ON lr.id_habitacion = h.id_habitacion
-            WHERE h.id_hotel = ?
-            ORDER BY r.id_reserva
+    try {
+        String jpql = """
+            SELECT DISTINCT r
+            FROM Reserva r
+            JOIN FETCH r.cliente
+            LEFT JOIN FETCH r.lineasReserva
+            WHERE EXISTS (
+                SELECT lr
+                FROM LineaReserva lr
+                WHERE lr.reserva = r
+                  AND lr.habitacion.hotel.idHotel = :idHotel
+            )
+            ORDER BY r.idReserva
             """;
 
-        try (Connection conexion = ConexionBD.obtenerConexion();
-             PreparedStatement sentencia = conexion.prepareStatement(sql)) {
+        List<Reserva> reservas = em.createQuery(
+            jpql, Reserva.class
+        )
+        .setParameter("idHotel", hotel.getIdHotel())
+        .getResultList();
 
-            sentencia.setInt(1, hotel.getIdHotel());
+        // Cargar las habitaciones antes de cerrar
+        // el EntityManager.
+        for (Reserva reserva : reservas) {
 
-            try (ResultSet resultado = sentencia.executeQuery()) {
-                while (resultado.next()) {
-                    ids.add(resultado.getInt("id_reserva"));
+            for (LineaReserva linea :
+                    reserva.getLineasReserva()) {
+
+                if (linea.getHabitacion() != null) {
+                    linea.getHabitacion().getNumero();
                 }
             }
-
-            return cargarVariasReservas(conexion, ids);
-
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                "Error al buscar reservas por hotel.", e
-            );
         }
+
+        return reservas;
+
+    } finally {
+        em.close();
     }
+}
 
     // --------------------------------------------------
     // BUSCAR POR FECHA DE ENTRADA
@@ -433,364 +401,296 @@ public class ReservaDAOImpl implements ReservaDAO {
         );
     }
 
-    private List<Reserva> buscarPorFecha(
-            String columna, LocalDate fecha) {
+    
+private List<Reserva> buscarPorFecha(
+        String columna, LocalDate fecha) {
 
-        if (!columna.equals("fecha_entrada")
-                && !columna.equals("fecha_salida")) {
-            throw new IllegalArgumentException("Columna no válida.");
-        }
-
-        List<Integer> ids = new ArrayList<>();
-
-        String sql = "SELECT id_reserva FROM reserva WHERE "
-                + columna + " = ? ORDER BY id_reserva";
-
-        try (Connection conexion = ConexionBD.obtenerConexion();
-             PreparedStatement sentencia = conexion.prepareStatement(sql)) {
-
-            sentencia.setDate(1, Date.valueOf(fecha));
-
-            try (ResultSet resultado = sentencia.executeQuery()) {
-                while (resultado.next()) {
-                    ids.add(resultado.getInt("id_reserva"));
-                }
-            }
-
-            return cargarVariasReservas(conexion, ids);
-
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                "Error al buscar reservas por fecha.", e
-            );
-        }
+    if (fecha == null) {
+        throw new IllegalArgumentException(
+            "La fecha no puede ser nula."
+        );
     }
 
+    // Convertir los nombres de columnas SQL
+    // en atributos de las entidades Java.
+    String atributo;
+
+    switch (columna) {
+        case "fecha_entrada":
+            atributo = "fechaEntrada";
+            break;
+
+        case "fecha_salida":
+            atributo = "fechaSalida";
+            break;
+
+        default:
+            throw new IllegalArgumentException(
+                "La columna indicada no es válida."
+            );
+    }
+
+    EntityManager em = JPAUtil.getEntityManagerFactory()
+            .createEntityManager();
+
+    try {
+        String jpql =
+            "SELECT DISTINCT r FROM Reserva r " +
+            "JOIN FETCH r.cliente " +
+            "LEFT JOIN FETCH r.lineasReserva " +
+            "WHERE r." + atributo + " = :fecha " +
+            "ORDER BY r.idReserva";
+
+        List<Reserva> reservas = em.createQuery(
+            jpql, Reserva.class
+        )
+        .setParameter("fecha", fecha)
+        .getResultList();
+
+        // Cargar las habitaciones relacionadas.
+        for (Reserva reserva : reservas) {
+
+            for (LineaReserva linea :
+                    reserva.getLineasReserva()) {
+
+                if (linea.getHabitacion() != null) {
+                    linea.getHabitacion().getNumero();
+                }
+            }
+        }
+
+        return reservas;
+
+    } finally {
+        em.close();
+    }
+}
     // --------------------------------------------------
     // BUSCAR POR ESTADO
     // --------------------------------------------------
 
-    @Override
-    public List<Reserva> buscarPorEstado(String estado) {
-
-        if (estado == null || estado.isBlank()) {
-            throw new IllegalArgumentException("El estado no puede estar vacío.");
-        }
-
-        List<Integer> ids = new ArrayList<>();
-
-        String sql = """
-            SELECT id_reserva
-            FROM reserva
-            WHERE estado = ?
-            ORDER BY id_reserva
-            """;
-
-        try (Connection conexion = ConexionBD.obtenerConexion();
-             PreparedStatement sentencia = conexion.prepareStatement(sql)) {
-
-            sentencia.setString(1, estado);
-
-            try (ResultSet resultado = sentencia.executeQuery()) {
-                while (resultado.next()) {
-                    ids.add(resultado.getInt("id_reserva"));
-                }
-            }
-
-            return cargarVariasReservas(conexion, ids);
-
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                "Error al buscar reservas por estado.", e
-            );
-        }
-    }
-
-    // --------------------------------------------------
-    // BUSCAR HABITACIONES DISPONIBLES
-    // --------------------------------------------------
-
-    @Override
-    public List<Habitacion> buscarHabitacionesDisponibles(
-            int idHotel,
-            LocalDate fechaEntrada,
-            LocalDate fechaSalida,
-            int numeroPersonas) {
-
-        if (idHotel <= 0 || numeroPersonas <= 0
-                || fechaEntrada == null || fechaSalida == null
-                || !fechaSalida.isAfter(fechaEntrada)) {
-            throw new IllegalArgumentException(
-                "Los datos de búsqueda de disponibilidad no son válidos."
-            );
-        }
-
-        List<Habitacion> habitaciones = new ArrayList<>();
-
-        String sql = """
-            SELECT h.id_habitacion, h.numero, h.categoria,
-                   h.capacidad, h.precio_noche
-            FROM habitacion h
-            WHERE h.id_hotel = ?
-              AND h.capacidad >= ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM linea_reserva lr
-                  INNER JOIN reserva r
-                      ON lr.id_reserva = r.id_reserva
-                  WHERE lr.id_habitacion = h.id_habitacion
-                    AND r.estado <> 'Cancelada'
-                    AND r.fecha_entrada < ?
-                    AND r.fecha_salida > ?
-              )
-            ORDER BY h.precio_noche, h.numero
-            """;
-
-        try (Connection conexion = ConexionBD.obtenerConexion();
-             PreparedStatement sentencia = conexion.prepareStatement(sql)) {
-
-            sentencia.setInt(1, idHotel);
-            sentencia.setInt(2, numeroPersonas);
-            sentencia.setDate(3, Date.valueOf(fechaSalida));
-            sentencia.setDate(4, Date.valueOf(fechaEntrada));
-
-            try (ResultSet resultado = sentencia.executeQuery()) {
-
-                while (resultado.next()) {
-
-                    habitaciones.add(new Habitacion(
-                        resultado.getInt("id_habitacion"),
-                        resultado.getInt("numero"),
-                        resultado.getString("categoria"),
-                        resultado.getInt("capacidad"),
-                        resultado.getDouble("precio_noche")
-                    ));
-                }
-            }
-
-            return habitaciones;
-
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                "Error al consultar habitaciones disponibles.", e
-            );
-        }
-    }
-
-    // --------------------------------------------------
-    // MODIFICAR ESTADO
-    // --------------------------------------------------
-
-    @Override
-    public void modificar(Reserva reserva, String nuevoEstado) {
-
-        if (reserva == null || nuevoEstado == null
-                || nuevoEstado.isBlank()) {
-            throw new IllegalArgumentException(
-                "La reserva y el nuevo estado son obligatorios."
-            );
-        }
-
-        String sql = """
-            UPDATE reserva
-            SET estado = ?
-            WHERE id_reserva = ?
-            """;
-
-        try (Connection conexion = ConexionBD.obtenerConexion();
-             PreparedStatement sentencia = conexion.prepareStatement(sql)) {
-
-            sentencia.setString(1, nuevoEstado);
-            sentencia.setInt(2, reserva.getIdReserva());
-
-            if (sentencia.executeUpdate() == 0) {
-                throw new IllegalArgumentException(
-                    "No existe la reserva indicada."
-                );
-            }
-
-            reserva.setEstado(nuevoEstado);
-
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                "Error al modificar la reserva.", e
-            );
-        }
-    }
-
-    // --------------------------------------------------
-    // CANCELAR RESERVA
-    // --------------------------------------------------
-
-    
+   
 @Override
-public boolean cancelar(int idReserva) {
-   String sql = "{CALL cancelar_reserva(?, ?)}";
+public List<Reserva> buscarPorEstado(String estado) {
 
-    try (Connection conexion = ConexionBD.obtenerConexion()) {
+    if (estado == null || estado.isBlank()) {
+        throw new IllegalArgumentException(
+            "El estado no puede estar vacío."
+        );
+    }
 
-        conexion.setAutoCommit(false);
+    EntityManager em = JPAUtil.getEntityManagerFactory()
+            .createEntityManager();
 
-        try (CallableStatement cs = conexion.prepareCall(sql)) {
+    try {
+        String jpql = """
+            SELECT DISTINCT r
+            FROM Reserva r
+            JOIN FETCH r.cliente
+            LEFT JOIN FETCH r.lineasReserva
+            WHERE r.estado = :estado
+            ORDER BY r.idReserva
+            """;
 
-            cs.setInt(1, idReserva);
-            cs.registerOutParameter(2, java.sql.Types.INTEGER);
+        List<Reserva> reservas = em.createQuery(
+            jpql, Reserva.class
+        )
+        .setParameter("estado", estado.trim())
+        .getResultList();
 
-            cs.execute();
+        // Cargar las habitaciones relacionadas
+        // antes de cerrar el EntityManager.
+        for (Reserva reserva : reservas) {
 
-            int filasAfectadas = cs.getInt(2);
+            for (LineaReserva linea :
+                    reserva.getLineasReserva()) {
 
-            conexion.commit();
-
-            return filasAfectadas > 0;
-
-        } catch (SQLException e) {
-            conexion.rollback();
-            throw new RuntimeException(
-                "Error al cancelar la reserva: " + e.getMessage(), e
-            );
+                if (linea.getHabitacion() != null) {
+                    linea.getHabitacion().getNumero();
+                }
+            }
         }
 
-    } catch (SQLException e) {
-        throw new RuntimeException(
-            "Error de conexión al cancelar la reserva: " + e.getMessage(), e
+        return reservas;
+
+    } catch (RuntimeException e) {
+
+        throw new IllegalStateException(
+            "Error al buscar reservas por estado.", e
         );
+
+    } finally {
+        em.close();
     }
 }
 
 
     // --------------------------------------------------
-    // MÉTODOS AUXILIARES PARA CONSULTAS
+    // BUSCAR HABITACIONES DISPONIBLES
     // --------------------------------------------------
+@Override
+public List<Habitacion> buscarHabitacionesDisponibles(
+        int idHotel,
+        LocalDate fechaEntrada,
+        LocalDate fechaSalida,
+        int numeroPersonas) {
 
-    private List<Reserva> buscarPorFiltro(String sql, int idCliente) {
+    if (idHotel <= 0 || numeroPersonas <= 0
+            || fechaEntrada == null || fechaSalida == null
+            || !fechaSalida.isAfter(fechaEntrada)) {
 
-        if (idCliente <= 0) {
-            throw new IllegalArgumentException("El ID del cliente no es válido.");
-        }
+        throw new IllegalArgumentException(
+            "Los datos de búsqueda de disponibilidad no son válidos."
+        );
+    }
 
-        List<Integer> ids = new ArrayList<>();
+    EntityManager em = JPAUtil.getEntityManagerFactory()
+            .createEntityManager();
 
-        try (Connection conexion = ConexionBD.obtenerConexion();
-             PreparedStatement sentencia = conexion.prepareStatement(sql)) {
+    try {
+        String jpql = """
+            SELECT h FROM Habitacion h
+            WHERE h.hotel.idHotel = :idHotel
+              AND h.capacidad >= :numeroPersonas
+              AND NOT EXISTS (
+                  SELECT lr FROM LineaReserva lr
+                  WHERE lr.habitacion = h
+                    AND lr.reserva.estado <> :cancelada
+                    AND lr.reserva.fechaEntrada < :fechaSalida
+                    AND lr.reserva.fechaSalida > :fechaEntrada
+              )
+            ORDER BY h.precioNoche, h.numero
+            """;
 
-            sentencia.setInt(1, idCliente);
+        return em.createQuery(jpql, Habitacion.class)
+                .setParameter("idHotel", idHotel)
+                .setParameter("numeroPersonas", numeroPersonas)
+                .setParameter("cancelada", "Cancelada")
+                .setParameter("fechaEntrada", fechaEntrada)
+                .setParameter("fechaSalida", fechaSalida)
+                .getResultList();
 
-            try (ResultSet resultado = sentencia.executeQuery()) {
-                while (resultado.next()) {
-                    ids.add(resultado.getInt("id_reserva"));
-                }
-            }
+    } finally {
+        em.close();
+    }
+}
 
-            return cargarVariasReservas(conexion, ids);
+    // --------------------------------------------------
+    // MODIFICAR ESTADO
+    // --------------------------------------------------
+@Override
+public void modificar(Reserva reserva, String nuevoEstado) {
 
-        } catch (SQLException e) {
-            throw new IllegalStateException(
-                "Error al buscar reservas del cliente.", e
+    if (reserva == null || reserva.getIdReserva() <= 0
+            || nuevoEstado == null
+            || nuevoEstado.isBlank()) {
+
+        throw new IllegalArgumentException(
+            "La reserva y el nuevo estado son obligatorios."
+        );
+    }
+
+    EntityManager em = JPAUtil.getEntityManagerFactory()
+            .createEntityManager();
+
+    EntityTransaction transaccion = em.getTransaction();
+
+    try {
+        transaccion.begin();
+
+        // Buscar la reserva existente en MySQL.
+        Reserva reservaBD = em.find(
+            Reserva.class,
+            reserva.getIdReserva(),
+            LockModeType.PESSIMISTIC_WRITE
+        );
+
+        if (reservaBD == null) {
+            throw new IllegalArgumentException(
+                "No existe la reserva indicada."
             );
         }
-    }
 
-    private List<Reserva> cargarVariasReservas(
-            Connection conexion, List<Integer> ids) throws SQLException {
+        // Modificar el estado de la entidad gestionada.
+        reservaBD.setEstado(nuevoEstado.trim());
 
-        List<Reserva> reservas = new ArrayList<>();
+        // Hibernate actualizará la base de datos.
+        transaccion.commit();
 
-        for (int id : ids) {
-            reservas.add(cargarReserva(conexion, id));
+        // Actualizar también el objeto recibido.
+        reserva.setEstado(reservaBD.getEstado());
+
+    } catch (RuntimeException e) {
+
+        if (transaccion.isActive()) {
+            transaccion.rollback();
         }
 
-        return reservas;
+        throw e;
+
+    } finally {
+        em.close();
+    }
+}
+    // --------------------------------------------------
+    // CANCELAR RESERVA
+    // --------------------------------------------------
+@Override
+public boolean cancelar(int idReserva) {
+
+    if (idReserva <= 0) {
+        throw new IllegalArgumentException(
+            "El ID de la reserva debe ser válido."
+        );
     }
 
-    private Reserva cargarReserva(Connection conexion, int idReserva)
-            throws SQLException {
+    EntityManager em = JPAUtil.getEntityManagerFactory()
+            .createEntityManager();
 
-        String sqlReserva = """
-            SELECT r.id_reserva, r.fecha_entrada, r.fecha_salida,
-                   r.numero_personas, r.estado, r.importe,
-                   p.id_persona, p.nombre, p.apellido,
-                   p.dni, p.email, p.telefono
-            FROM reserva r
-            INNER JOIN cliente c
-                ON r.id_cliente = c.id_persona
-            INNER JOIN persona p
-                ON c.id_persona = p.id_persona
-            WHERE r.id_reserva = ?
-            """;
+    EntityTransaction transaccion = em.getTransaction();
 
-        Reserva reserva;
+    try {
+        transaccion.begin();
 
-        try (PreparedStatement sentencia =
-                conexion.prepareStatement(sqlReserva)) {
+        // Buscar la reserva y bloquearla durante
+        // la modificación.
+        Reserva reserva = em.find(
+            Reserva.class,
+            idReserva,
+            LockModeType.PESSIMISTIC_WRITE
+        );
 
-            sentencia.setInt(1, idReserva);
+        // Comprobar que existe y no está cancelada.
+        if (reserva == null ||
+                "Cancelada".equalsIgnoreCase(
+                    reserva.getEstado())) {
 
-            try (ResultSet resultado = sentencia.executeQuery()) {
-
-                if (!resultado.next()) {
-                    throw new SQLException(
-                        "No se encontró la reserva " + idReserva
-                    );
-                }
-
-                reserva = new Reserva(
-                    resultado.getInt("id_reserva"),
-                    resultado.getDate("fecha_entrada").toLocalDate(),
-                    resultado.getDate("fecha_salida").toLocalDate(),
-                    resultado.getInt("numero_personas"),
-                    resultado.getString("estado")
-                );
-
-                reserva.setImporte(resultado.getDouble("importe"));
-
-                Cliente cliente = new Cliente(
-                    resultado.getInt("id_persona"),
-                    resultado.getString("nombre"),
-                    resultado.getString("apellido"),
-                    resultado.getString("dni"),
-                    resultado.getString("email"),
-                    resultado.getString("telefono")
-                );
-
-                reserva.setCliente(cliente);
-            }
+            transaccion.commit();
+            return false;
         }
 
-        String sqlLineas = """
-            SELECT h.id_habitacion, h.numero, h.categoria,
-                   h.capacidad, lr.precio_noche
-            FROM linea_reserva lr
-            INNER JOIN habitacion h
-                ON lr.id_habitacion = h.id_habitacion
-            WHERE lr.id_reserva = ?
-            """;
+        // Cambiar el estado de la reserva.
+        reserva.cancelar();
 
-        try (PreparedStatement sentencia =
-                conexion.prepareStatement(sqlLineas)) {
+        // Hibernate detecta el cambio en la entidad
+        // gestionada y lo actualiza en MySQL.
+        transaccion.commit();
 
-            sentencia.setInt(1, idReserva);
+        return true;
 
-            try (ResultSet resultado = sentencia.executeQuery()) {
+    } catch (RuntimeException e) {
 
-                while (resultado.next()) {
-
-                    Habitacion habitacion = new Habitacion(
-                        resultado.getInt("id_habitacion"),
-                        resultado.getInt("numero"),
-                        resultado.getString("categoria"),
-                        resultado.getInt("capacidad"),
-                        resultado.getDouble("precio_noche")
-                    );
-
-                    reserva.agregarLineaReserva(
-                        habitacion,
-                        resultado.getDouble("precio_noche")
-                    );
-                }
-            }
+        if (transaccion.isActive()) {
+            transaccion.rollback();
         }
 
-        return reserva;
+        throw new IllegalStateException(
+            "Error al cancelar la reserva.", e
+        );
+
+    } finally {
+        em.close();
     }
+}
+   
 }
